@@ -1,0 +1,45 @@
+# Python cache/build artifacts
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments and local env files
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# CARLA recorder generated datasets
+carla/output/
+carla/validation_output/
+carla/**/camera/data/
+carla/**/lidar/data/
+carla/**/imu/data/
+carla/**/camera/timestamps.txt
+carla/**/lidar/timestamps.txt
+carla/**/imu/timestamps.txt
+carla/**/meta.yaml
+carla/**/route.json
+
+# Large generated sensor files, wherever they land
+*.bin
+*.png
+*.jpg
+*.jpeg
+*.npy
+*.npz
+*.pcd
+*.ply
+*.bag
+*.db3
+
+# Local logs and temporary files
+*.log
+*.tmp
+*.temp
+Thumbs.db
+.DS_Store
