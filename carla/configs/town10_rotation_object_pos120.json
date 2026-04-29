@@ -1,0 +1,16 @@
+{
+  "no_camera": true,
+  "map": "Town10HD",
+  "ego_blueprint": "vehicle.tesla.model3",
+  "target_blueprint": "vehicle.audi.tt",
+  "target_x": 55.542,
+  "target_y": 130.46,
+  "target_z": 0.6,
+  "target_yaw": -179.68,
+  "orbit_half_length": 16.0,
+  "orbit_half_width": 12.0,
+  "corner_radius": 4.0,
+  "orbit_laps": 1.0,
+  "target_speed_kmh": 15.0,
+  "out_root": "carla/validation_output"
+}

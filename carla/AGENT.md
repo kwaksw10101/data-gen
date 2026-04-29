@@ -164,12 +164,156 @@ If a sensor packet is missing during recording:
 
 Use this section as the first checkpoint when continuing work after context compaction or in a new chat. The user may say "continue previous work"; in that case read this file and inspect `carla_sync_camera_lidar_imu_recorder.py` before making edits.
 
+## Requested Next Recorder Modes
+
+The user wants two additional dataset-generation modes, but each mode should be implemented as its own Python script rather than expanding `carla_sync_camera_lidar_imu_recorder.py`.
+
+Keep the existing synchronized camera/LiDAR/IMU recording behavior and metadata conventions where practical. These new scripts are still data-generation tools, not full perception/SLAM/tracking pipelines. Do not implement point-cloud cropping, SLAM map processing, or target tracking algorithms unless the user asks later.
+
+### 1. Rotation Around Object Recorder
+
+Create a separate script:
+
+```text
+carla/carla_rotation_around_object_recorder.py
+```
+
+Purpose:
+
+- Spawn an ego vehicle A with the existing camera/LiDAR/IMU sensor rig.
+- Spawn a target object B as a vehicle actor.
+- Move A once around B so a later SLAM/map pipeline can isolate B's point cloud from a known region.
+- Only implement the data-generation part: "A drives around B once."
+
+Implementation requirements:
+
+- A and B must use deterministic, explicitly configurable vehicle blueprints so repeated runs spawn the same vehicle types.
+  - Suggested CLI:
+    - `--ego-blueprint vehicle.tesla.model3`
+    - `--target-blueprint vehicle.audi.tt`
+    - Keep `--ego-filter` only as a fallback if an exact blueprint is not found.
+- B should be spawned as a static or handbraked vehicle actor with physics disabled if needed for repeatability.
+- A should not drive a perfect circle. Use a smooth rounded-rectangle / rounded-square path around B.
+  - Four straight sides plus smooth corner arcs is preferred.
+  - A should face mostly along the path tangent, with the LiDAR naturally observing B from multiple sides.
+  - Suggested parameters: `--orbit-half-width`, `--orbit-half-length`, `--corner-radius`, `--orbit-laps`, `--target-speed-kmh`.
+- The script must ensure there is enough open space around B before recording.
+  - Prefer loading/using a map area with broad open space rather than narrow roads.
+  - Candidate maps/areas should be configurable with `--map` and explicit `--target-location` / `--target-yaw`.
+  - A first implementation may ship with curated defaults for a wide, low-obstacle area, but should fail clearly if the target area cannot support the requested orbit extents.
+- Use kinematic transform playback for A unless physical driving is specifically needed. Deterministic path following is more important than realistic tire dynamics.
+- Warm up and validate sensors before moving, as in the existing recorder.
+- Save target metadata in `meta.yaml`.
+
+Suggested metadata:
+
+```yaml
+scenario:
+  mode: "rotation-around-object"
+  ego_blueprint: "vehicle.tesla.model3"
+  target_blueprint: "vehicle.audi.tt"
+  target_pose_carla: {x: 0.0, y: 0.0, z: 0.0, roll: 0.0, pitch: 0.0, yaw: 0.0}
+  orbit_half_width_m: 12.0
+  orbit_half_length_m: 16.0
+  corner_radius_m: 4.0
+  orbit_laps: 1.0
+  target_speed_kmh: 15.0
+  completed: true
+```
+
+Validation expectations:
+
+- A completes one full rounded-rectangle orbit around B.
+- B remains fixed and visible to LiDAR from multiple sides.
+- No missing LiDAR partials, missing IMU frames, or dropped partial sweeps.
+- The dataset is marked invalid if the orbit cannot be completed or the target area clearance check fails.
+
+### 2. Dual Vehicle Free-Motion Tracking Recorder
+
+Create a separate script:
+
+```text
+carla/carla_dual_vehicle_tracking_recorder.py
+```
+
+Purpose:
+
+- Spawn ego vehicle A with the existing camera/LiDAR/IMU sensor rig.
+- Spawn target vehicle B nearby.
+- Move A and B near each other in a broad open area so later code can use A's LiDAR to track B's position.
+- Only implement data generation and ground-truth metadata. Do not implement a LiDAR tracking algorithm.
+
+Implementation requirements:
+
+- A and B must use deterministic, explicitly configurable vehicle blueprints.
+  - Suggested CLI:
+    - `--ego-blueprint vehicle.tesla.model3`
+    - `--target-blueprint vehicle.audi.tt`
+- The mode should not require A and B to have identical motion.
+- Prefer broad, free-space motion over road-following Traffic Manager behavior.
+  - Use configurable open-area bounds centered at a chosen location.
+  - Use deterministic kinematic trajectories by default.
+  - Suggested trajectory families: rounded rectangles, figure-eight, offset sinusoidal paths, or waypoint loops within the same open area.
+- Keep A close enough for LiDAR observations of B but avoid collisions.
+  - Suggested parameters: `--area-width`, `--area-length`, `--min-separation`, `--max-separation`, `--duration`, `--ego-speed-kmh`, `--target-speed-kmh`.
+- Record per-frame or per-tick ground-truth target pose relative to A, in addition to the normal sensor streams.
+  - Suggested output: `target_pose/timestamps.txt` or `target_pose/data.csv`.
+  - Include both CARLA world pose for B and relative pose from A to B.
+- Warm up and validate sensors before moving, as in the existing recorder.
+
+Suggested metadata:
+
+```yaml
+scenario:
+  mode: "dual-vehicle-free-motion-tracking"
+  ego_blueprint: "vehicle.tesla.model3"
+  target_blueprint: "vehicle.audi.tt"
+  area_center_carla: {x: 0.0, y: 0.0, z: 0.0}
+  area_width_m: 40.0
+  area_length_m: 60.0
+  min_separation_m: 8.0
+  max_separation_m: 35.0
+  ego_trajectory: "rounded-rectangle"
+  target_trajectory: "figure-eight"
+  completed: true
+```
+
+Validation expectations:
+
+- A and B move simultaneously in the selected open area.
+- B remains within useful LiDAR range of A for most of the run.
+- A and B do not collide or leave the configured area bounds.
+- Ground-truth B pose relative to A is written for downstream tracking evaluation.
+- The dataset is marked invalid if separation, collision, area-bound, or sensor-sync constraints are violated.
+
+### Shared Guidance For New Scenario Scripts
+
+- Prefer sharing/refactoring the existing recorder's proven utilities instead of copy-pasting large blocks indefinitely.
+  - Good candidates: CARLA import/path setup, blueprint configuration, sensor writers, sensor buffers, warmup/sync validation, metadata helpers, and cleanup.
+  - If refactoring, keep behavior equivalent for the already-validated route-loop recorder.
+- Keep synchronous CARLA ticking and integer sensor periods.
+- Preserve output coordinate conventions:
+  - LiDAR/IMU outputs use ROS body frame `x forward, y left, z up`.
+  - CARLA y is flipped for exported sensor vectors.
+- Add clear CLI examples to `README.md` after the scripts exist.
+- Fail early with explicit messages when maps, spawn poses, vehicle blueprints, clearance checks, or route generation cannot satisfy the requested scenario.
+- Use deterministic seeds and save all scenario parameters into `meta.yaml`.
+
 ### Current Implemented State
 
 Main script:
 
 ```text
 data-gen/carla/carla_sync_camera_lidar_imu_recorder.py
+```
+
+Additional scenario script now present:
+
+```text
+data-gen/carla/carla_rotation_around_object_recorder.py
+data-gen/carla/carla_dual_vehicle_tracking_recorder.py
+data-gen/carla/configs/town10_rotation_object_pos120.json
+data-gen/carla/configs/town10_dual_tracking_pos137.json
 ```
 
 Implemented features as of the last session:
@@ -198,6 +342,44 @@ Implemented features as of the last session:
 - Route metadata is appended to `meta.yaml` through `append_route_summary()`.
 - Warmup/sync validation stats are appended to `meta.yaml` through `append_sync_summary()`.
 - Dataset validity status is appended to `meta.yaml` through `append_dataset_status()`.
+
+Rotation-around-object script:
+
+- Supports `--config <json>`. Config keys use argparse destination names, e.g. `target_x`, `orbit_half_length`, `no_camera`. Explicit CLI flags override config values.
+- Spawns ego vehicle A with the existing camera/LiDAR/IMU rig.
+- Supports `--no-camera`, which skips the camera actor, camera listener, camera warmup validation, camera writer, and camera output directory.
+- Spawns target vehicle B from deterministic `--target-blueprint`.
+- Uses deterministic `--ego-blueprint` for A, with fallback filters if exact blueprints are unavailable.
+- Moves A kinematically around B on a rounded-rectangle path, controlled by `--orbit-half-length`, `--orbit-half-width`, `--corner-radius`, `--orbit-direction`, `--orbit-laps`, and `--target-speed-kmh`.
+- Uses the existing synchronous world tick, sensor warmup/validation, sensor writers, LiDAR packet merge, synthetic IMU style, and dataset status helpers.
+- Saves `orbit_path.json` plus a `scenario:` section in `meta.yaml`.
+- Performs a basic target-clearance check using B's actor bounding box and the nearest orbit radius. This does not guarantee static environment clearance; users should still choose a broad open map area or explicit target pose.
+- Curated Town10HD config currently available:
+  - `carla/configs/town10_rotation_object_pos120.json`
+  - Pose was found by probing temporary actor spawns along the rounded-rectangle path.
+
+Dual-vehicle tracking script:
+
+- Supports `--config <json>`. Config keys use argparse destination names, e.g. `area_center_x`, `area_length`, `no_camera`. Explicit CLI flags override config values.
+- Spawns ego vehicle A with the existing camera/LiDAR/IMU rig.
+- Supports `--no-camera`, which skips the camera actor, camera listener, camera warmup validation, camera writer, and camera output directory.
+- Spawns target vehicle B from deterministic `--target-blueprint`.
+- Uses deterministic `--ego-blueprint` for A, with fallback filters if exact blueprints are unavailable.
+- Moves A and B simultaneously with kinematic open-area trajectories.
+  - By default, the configured area is split into separated A/B zones with `--zone-gap`.
+  - A defaults to a rounded-rectangle path inside its zone.
+  - B defaults to a figure-eight path inside its zone.
+  - `--shared-area` disables zone separation when intentionally needed.
+- Before recording, sampled A/B trajectories are checked against `max(--min-separation, ego_radius + target_radius + --collision-margin)`. If the sampled planned paths are too close, the script fails before recording.
+- Main controls include `--area-length`, `--area-width`, `--area-spawn-index`, explicit `--area-center-x/y/z`, `--duration`, `--ego-speed-kmh`, `--target-speed-kmh`, `--min-separation`, `--max-separation`, `--zone-gap`, and `--collision-margin`.
+- Writes normal camera/LiDAR/IMU streams from A.
+- Writes B ground truth at every world tick to `target_pose/data.csv`.
+  - Includes A world pose, B world pose, relative B position in A's ROS-style body axes, distance, bearing, and relative yaw.
+- Saves `scenario_paths.json` plus a `scenario:` section in `meta.yaml`.
+- Marks the dataset invalid if sensor sync fails, LiDAR partials are dropped, A/B violate min/max separation, or either vehicle leaves the configured area bounds.
+- Curated Town10HD config currently available:
+  - `carla/configs/town10_dual_tracking_pos137.json`
+  - Area was found by probing temporary actor spawns on sampled A/B trajectories.
 
 Important functions currently present:
 
