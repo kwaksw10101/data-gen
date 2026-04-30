@@ -133,11 +133,11 @@ A run directory contains:
 
 ```text
 camera/data/*.png
-camera/timestamps.txt
+camera/timestamps.csv
 lidar/data/*.bin
-lidar/timestamps.txt
+lidar/timestamps.csv
 imu/data/*.bin
-imu/timestamps.txt
+imu/timestamps.csv
 meta.yaml
 route.json
 ```

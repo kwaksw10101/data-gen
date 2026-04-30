@@ -5,9 +5,9 @@ Expected dataset layout:
 
   dataset/
     meta.yaml
-    camera/timestamps.txt
+    camera/timestamps.csv
     camera/data/000000.png
-    lidar/timestamps.txt
+    lidar/timestamps.csv
     lidar/data/000000.bin
 
 LiDAR BIN files are the recorder format: float32 row-major Nx6
@@ -17,6 +17,7 @@ LiDAR BIN files are the recorder format: float32 row-major Nx6
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import struct
 import sys
@@ -56,24 +57,49 @@ def resolve_dataset(path_text: str) -> Path:
 def parse_timestamp_file(path: Path, data_dir: Path, suffix: str, default_rate_hz: float) -> List[TimedFile]:
     rows: List[TimedFile] = []
     if path.exists():
-        with path.open("r", encoding="ascii") as f:
-            for line_no, line in enumerate(f, 1):
-                line = line.strip()
-                if not line or line.startswith("#"):
-                    continue
-                parts = line.split()
-                if len(parts) < 3:
-                    raise ValueError(f"{path}:{line_no}: expected at least 3 columns")
-                seq = int(parts[0])
-                stamp = float(parts[1])
-                frame = int(parts[2])
-                rows.append(TimedFile(seq, stamp, frame, data_dir / f"{seq:06d}{suffix}"))
+        if path.suffix.lower() == ".csv":
+            with path.open("r", encoding="ascii", newline="") as f:
+                reader = csv.DictReader(f)
+                if reader.fieldnames is None:
+                    raise ValueError(f"{path}: missing CSV header")
+                for line_no, row in enumerate(reader, 2):
+                    seq_text = row.get("seq")
+                    if not seq_text:
+                        continue
+                    stamp_text = row.get("timestamp_seconds", row.get("sweep_end_timestamp_seconds"))
+                    frame_text = row.get("carla_frame", row.get("sweep_end_carla_frame"))
+                    if stamp_text is None or frame_text is None:
+                        raise ValueError(f"{path}:{line_no}: missing timestamp/frame columns")
+                    seq = int(seq_text)
+                    stamp = float(stamp_text)
+                    frame = int(frame_text)
+                    rows.append(TimedFile(seq, stamp, frame, data_dir / f"{seq:06d}{suffix}"))
+        else:
+            with path.open("r", encoding="ascii") as f:
+                for line_no, line in enumerate(f, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = line.split()
+                    if len(parts) < 3:
+                        raise ValueError(f"{path}:{line_no}: expected at least 3 columns")
+                    seq = int(parts[0])
+                    stamp = float(parts[1])
+                    frame = int(parts[2])
+                    rows.append(TimedFile(seq, stamp, frame, data_dir / f"{seq:06d}{suffix}"))
     else:
         period = 1.0 / default_rate_hz
         for i, file_path in enumerate(sorted(data_dir.glob(f"*{suffix}"))):
             rows.append(TimedFile(i, i * period, i, file_path))
 
     return [row for row in rows if row.path.exists()]
+
+
+def timestamp_path(dataset: Path, sensor_name: str) -> Path:
+    csv_path = dataset / sensor_name / "timestamps.csv"
+    if csv_path.exists():
+        return csv_path
+    return dataset / sensor_name / "timestamps.txt"
 
 
 def load_meta(dataset: Path) -> Dict[str, Any]:
@@ -246,34 +272,32 @@ def validate_dataset(
 
     if enable_camera:
         camera = parse_timestamp_file(
-            dataset / "camera" / "timestamps.txt",
+            timestamp_path(dataset, "camera"),
             dataset / "camera" / "data",
             ".png",
             float(nested(meta, "camera", "rate_hz", default=20.0)),
         )
-    if enable_camera and not camera:
-        raise FileNotFoundError(f"no camera PNG frames found under {dataset / 'camera' / 'data'}")
 
     if enable_lidar:
         lidar = parse_timestamp_file(
-            dataset / "lidar" / "timestamps.txt",
+            timestamp_path(dataset, "lidar"),
             dataset / "lidar" / "data",
             ".bin",
             float(nested(meta, "lidar", "rate_hz", default=10.0)),
         )
-    if enable_lidar and not lidar:
-        raise FileNotFoundError(f"no LiDAR BIN sweeps found under {dataset / 'lidar' / 'data'}")
 
-    if enable_camera:
+    if enable_camera and camera:
         first_image = read_png_from_recorder(camera[0].path)
         status_lines.append(
             f"[OK] camera frames={len(camera)} first={camera[0].path.name} "
             f"{first_image.width}x{first_image.height} {first_image.encoding}"
         )
+    elif enable_camera:
+        status_lines.append(f"[SKIP] camera missing under {dataset / 'camera' / 'data'}")
     else:
         status_lines.append("[SKIP] camera disabled")
 
-    if enable_lidar:
+    if enable_lidar and lidar:
         bad_lidar = [row.path for row in lidar[:20] if row.path.stat().st_size % 24 != 0]
         if bad_lidar:
             raise ValueError(f"LiDAR file size is not divisible by 24 bytes: {bad_lidar[0]}")
@@ -281,8 +305,19 @@ def validate_dataset(
             f"[OK] lidar sweeps={len(lidar)} first={lidar[0].path.name} "
             f"points={lidar[0].path.stat().st_size // 24}"
         )
+    elif enable_lidar:
+        status_lines.append(f"[SKIP] lidar missing under {dataset / 'lidar' / 'data'}")
     else:
         status_lines.append("[SKIP] lidar disabled")
+
+    if not camera and not lidar:
+        requested = []
+        if enable_camera:
+            requested.append("camera")
+        if enable_lidar:
+            requested.append("lidar")
+        requested_text = ",".join(requested) if requested else "camera,lidar"
+        raise FileNotFoundError(f"no playable data found for requested sensors: {requested_text}")
 
     print("\n".join(status_lines))
     return camera, lidar, meta

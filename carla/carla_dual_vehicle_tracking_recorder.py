@@ -737,9 +737,28 @@ def main() -> None:
         )
         imu_writer = rec.ImuWriter(os.path.join(imu_dir, "data"), max_queue=args.max_writer_queue)
 
-        f_cam_ts = open(os.path.join(camera_dir, "timestamps.txt"), "w", encoding="ascii", buffering=1) if camera_dir is not None else None
-        f_lidar_ts = open(os.path.join(lidar_dir, "timestamps.txt"), "w", encoding="ascii", buffering=1)
-        f_imu_ts = open(os.path.join(imu_dir, "timestamps.txt"), "w", encoding="ascii", buffering=1)
+        f_cam_ts = (
+            rec.open_csv_with_header(
+                os.path.join(camera_dir, "timestamps.csv"),
+                ("seq", "timestamp_seconds", "carla_frame"),
+            )
+            if camera_dir is not None
+            else None
+        )
+        f_lidar_ts = rec.open_csv_with_header(
+            os.path.join(lidar_dir, "timestamps.csv"),
+            (
+                "seq",
+                "sweep_end_timestamp_seconds",
+                "sweep_end_carla_frame",
+                "sweep_start_timestamp_seconds",
+                "sweep_start_carla_frame",
+            ),
+        )
+        f_imu_ts = rec.open_csv_with_header(
+            os.path.join(imu_dir, "timestamps.csv"),
+            ("seq", "timestamp_seconds", "carla_frame"),
+        )
         f_pose = open(os.path.join(target_pose_dir, "data.csv"), "w", encoding="ascii", buffering=1)
         write_pose_header(f_pose)
 
@@ -837,7 +856,10 @@ def main() -> None:
                 print(f"[WARN] missing IMU frame={world_frame}")
             else:
                 imu_writer.push((seq_imu, synthetic_imu_values(imu_meas, ego_state)))
-                f_imu_ts.write(f"{seq_imu:06d} {rec.format_float(float(imu_meas.timestamp))} {int(imu_meas.frame)}\n")
+                rec.write_csv_row(
+                    f_imu_ts,
+                    (f"{seq_imu:06d}", rec.format_float(float(imu_meas.timestamp)), int(imu_meas.frame)),
+                )
                 imu_stamps.append(float(imu_meas.timestamp))
                 seq_imu += 1
 
@@ -856,9 +878,15 @@ def main() -> None:
                     end_ts = lidar_packets[-1][1]
                     end_frame = lidar_packets[-1][2]
                     lidar_writer.push((seq_lidar, lidar_packets))
-                    f_lidar_ts.write(
-                        f"{seq_lidar:06d} {rec.format_float(end_ts)} {end_frame} "
-                        f"{rec.format_float(start_ts)} {start_packet_frame}\n"
+                    rec.write_csv_row(
+                        f_lidar_ts,
+                        (
+                            f"{seq_lidar:06d}",
+                            rec.format_float(end_ts),
+                            end_frame,
+                            rec.format_float(start_ts),
+                            start_packet_frame,
+                        ),
                     )
                     lidar_stamps.append(end_ts)
                     seq_lidar += 1
@@ -867,7 +895,10 @@ def main() -> None:
             if camera_buf is not None and camera_writer is not None and f_cam_ts is not None:
                 for cam_meas in camera_buf.pop_all_ready(world_frame, warmup_frame):
                     camera_writer.push((seq_camera, bytes(cam_meas.raw_data), int(cam_meas.width), int(cam_meas.height)))
-                    f_cam_ts.write(f"{seq_camera:06d} {rec.format_float(float(cam_meas.timestamp))} {int(cam_meas.frame)}\n")
+                    rec.write_csv_row(
+                        f_cam_ts,
+                        (f"{seq_camera:06d}", rec.format_float(float(cam_meas.timestamp)), int(cam_meas.frame)),
+                    )
                     camera_stamps.append(float(cam_meas.timestamp))
                     seq_camera += 1
 
@@ -886,7 +917,10 @@ def main() -> None:
         if camera_buf is not None and camera_writer is not None and f_cam_ts is not None:
             for cam_meas in camera_buf.pop_all_ready(10**12, warmup_frame):
                 camera_writer.push((seq_camera, bytes(cam_meas.raw_data), int(cam_meas.width), int(cam_meas.height)))
-                f_cam_ts.write(f"{seq_camera:06d} {rec.format_float(float(cam_meas.timestamp))} {int(cam_meas.frame)}\n")
+                rec.write_csv_row(
+                    f_cam_ts,
+                    (f"{seq_camera:06d}", rec.format_float(float(cam_meas.timestamp)), int(cam_meas.frame)),
+                )
                 camera_stamps.append(float(cam_meas.timestamp))
                 seq_camera += 1
 
