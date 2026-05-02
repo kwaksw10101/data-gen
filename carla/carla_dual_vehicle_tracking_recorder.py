@@ -489,10 +489,10 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
         )
 
     text = "\nscenario:\n"
-    text += "  mode: \"dual-vehicle-free-motion-tracking\"\n"
+    text += f"  mode: {rec.yaml_quote('dual-vehicle-free-motion-tracking')}\n"
     text += f"  completed: {str(bool(summary['completed'])).lower()}\n"
-    text += f"  ego_blueprint: \"{summary['ego_blueprint']}\"\n"
-    text += f"  target_blueprint: \"{summary['target_blueprint']}\"\n"
+    text += f"  ego_blueprint: {rec.yaml_quote(summary['ego_blueprint'])}\n"
+    text += f"  target_blueprint: {rec.yaml_quote(summary['target_blueprint'])}\n"
     text += f"  area_center_carla: {pose(summary['area_center_carla'])}\n"
     text += f"  area_length_m: {summary['area_length_m']:.9f}\n"
     text += f"  area_width_m: {summary['area_width_m']:.9f}\n"
@@ -506,8 +506,8 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  min_separation_violations: {summary['min_separation_violations']}\n"
     text += f"  max_separation_violations: {summary['max_separation_violations']}\n"
     text += f"  area_bound_violations: {summary['area_bound_violations']}\n"
-    text += f"  ego_trajectory: \"{summary['ego_trajectory']}\"\n"
-    text += f"  target_trajectory: \"{summary['target_trajectory']}\"\n"
+    text += f"  ego_trajectory: {rec.yaml_quote(summary['ego_trajectory'])}\n"
+    text += f"  target_trajectory: {rec.yaml_quote(summary['target_trajectory'])}\n"
     text += f"  ego_speed_kmh: {summary['ego_speed_kmh']:.9f}\n"
     text += f"  target_speed_kmh: {summary['target_speed_kmh']:.9f}\n"
     text += f"  duration_s: {summary['duration_s']:.9f}\n"
@@ -515,8 +515,8 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  start_timestamp: {summary['start_timestamp']:.9f}\n"
     text += f"  end_frame: {summary['end_frame']}\n"
     text += f"  end_timestamp: {summary['end_timestamp']:.9f}\n"
-    text += "  target_pose_file: \"target_pose/data.csv\"\n"
-    text += "  scenario_paths_file: \"scenario_paths.json\"\n"
+    text += f"  target_pose_file: {rec.yaml_quote('target_pose/data.csv')}\n"
+    text += f"  scenario_paths_file: {rec.yaml_quote('scenario_paths.json')}\n"
     with open(path, "a", encoding="utf-8", newline="\n") as f:
         f.write(text)
 
