@@ -22,7 +22,7 @@ import shlex
 import sys
 import time
 from datetime import datetime
-from typing import Any, Dict, List, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import carla_sync_camera_lidar_imu_recorder as rec
 
@@ -38,6 +38,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--out-root", default=os.path.join("data-gen", "carla", "output"))
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--seed", type=int, default=7)
+    ap.add_argument("--preview-only", action="store_true", help="Spawn ego/target and run the orbit without sensors or file output")
 
     ap.add_argument("--warmup-ticks", type=int, default=20)
     ap.add_argument("--warmup-min-ticks", type=int, default=50)
@@ -69,6 +70,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lidar-x", type=float, default=0.0)
     ap.add_argument("--lidar-y", type=float, default=0.0)
     ap.add_argument("--lidar-z", type=float, default=1.9)
+    ap.add_argument(
+        "--lidar-point-frame",
+        choices=["lidar", "base_link"],
+        default="lidar",
+        help="Coordinate frame used for saved LiDAR XYZ points. Default preserves raw sensor-frame output.",
+    )
 
     ap.add_argument("--imu-hz", type=float, default=100.0)
     ap.add_argument("--imu-x", type=float, default=0.0)
@@ -95,7 +102,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--orbit-yaw-offset", type=float, default=0.0)
     ap.add_argument("--orbit-direction", choices=["ccw", "cw"], default="ccw")
     ap.add_argument("--orbit-laps", type=float, default=1.0)
-    ap.add_argument("--target-speed-kmh", type=float, default=15.0)
+    ap.add_argument("--target-speed-kmh", type=float, default=7.0)
     ap.add_argument("--path-step-m", type=float, default=0.5)
     ap.add_argument("--lookahead-m", type=float, default=2.0)
     ap.add_argument("--min-target-clearance", type=float, default=4.0)
@@ -246,16 +253,17 @@ def build_rounded_rectangle_path(carla: Any, center: Any, yaw_deg: float, args: 
             a = math.radians(start_deg) + delta * (i / n)
             add_local(cx + radius * math.cos(a), cy + radius * math.sin(a))
 
-    start = (half_l, -half_w + radius)
+    start = (0.0, -half_w)
     add_local(*start)
-    add_line(start, (half_l, half_w - radius))
+    add_line(start, (half_l - radius, -half_w))
+    add_arc(half_l - radius, -half_w + radius, 270.0, 360.0)
+    add_line((half_l, -half_w + radius), (half_l, half_w - radius))
     add_arc(half_l - radius, half_w - radius, 0.0, 90.0)
     add_line((half_l - radius, half_w), (-half_l + radius, half_w))
     add_arc(-half_l + radius, half_w - radius, 90.0, 180.0)
     add_line((-half_l, half_w - radius), (-half_l, -half_w + radius))
     add_arc(-half_l + radius, -half_w + radius, 180.0, 270.0)
-    add_line((-half_l + radius, -half_w), (half_l - radius, -half_w))
-    add_arc(half_l - radius, -half_w + radius, 270.0, 360.0)
+    add_line((-half_l + radius, -half_w), start)
 
     if args.orbit_direction == "cw":
         local_points = [local_points[0]] + list(reversed(local_points[1:-1])) + [local_points[0]]
@@ -409,6 +417,89 @@ def save_orbit_path(path: str, nodes: Sequence[Any], cumulative: Sequence[float]
     with open(path, "w", encoding="utf-8", newline="\n") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
+
+
+def save_trajectory_svg(
+    path: str,
+    trajectory: Sequence[Dict[str, float]],
+    planned_nodes: Sequence[Any],
+    target_location: Any,
+    target_radius_m: Optional[float],
+) -> None:
+    actual_xy = [(float(p["x"]), float(p["y"])) for p in trajectory]
+    planned_xy = [(float(loc.x), float(loc.y)) for loc in planned_nodes]
+    target_xy = (float(target_location.x), float(target_location.y))
+    all_xy = actual_xy + planned_xy + [target_xy]
+    if len(all_xy) < 2:
+        return
+
+    min_x = min(x for x, _ in all_xy)
+    max_x = max(x for x, _ in all_xy)
+    min_y = min(y for _, y in all_xy)
+    max_y = max(y for _, y in all_xy)
+    span_x = max(1e-6, max_x - min_x)
+    span_y = max(1e-6, max_y - min_y)
+    pad_m = max(2.0, 0.08 * max(span_x, span_y))
+    min_x -= pad_m
+    max_x += pad_m
+    min_y -= pad_m
+    max_y += pad_m
+    span_x = max_x - min_x
+    span_y = max_y - min_y
+
+    width = 1200.0
+    height = max(400.0, width * span_y / span_x)
+    scale = width / span_x
+
+    def sx(x: float) -> float:
+        return (x - min_x) * scale
+
+    def sy(y: float) -> float:
+        return (max_y - y) * scale
+
+    def polyline(points: Sequence[Tuple[float, float]]) -> str:
+        return " ".join(f"{sx(x):.2f},{sy(y):.2f}" for x, y in points)
+
+    start_marker = ""
+    end_marker = ""
+    if actual_xy:
+        start_x, start_y = actual_xy[0]
+        end_x, end_y = actual_xy[-1]
+        start_marker = f'<circle cx="{sx(start_x):.2f}" cy="{sy(start_y):.2f}" r="5" fill="#22c55e"/>'
+        end_marker = f'<circle cx="{sx(end_x):.2f}" cy="{sy(end_y):.2f}" r="5" fill="#ef4444"/>'
+
+    target_r_px = max(5.0, float(target_radius_m or 0.0) * scale)
+    actual_path = (
+        f'<polyline points="{polyline(actual_xy)}" fill="none" stroke="#2563eb" '
+        f'stroke-width="3" stroke-linecap="round" stroke-linejoin="round"/>'
+        if len(actual_xy) >= 2
+        else ""
+    )
+    planned_path = (
+        f'<polyline points="{polyline(planned_xy)}" fill="none" stroke="#94a3b8" '
+        f'stroke-width="2" stroke-dasharray="8 8" stroke-linecap="round" stroke-linejoin="round"/>'
+        if len(planned_xy) >= 2
+        else ""
+    )
+
+    svg = f"""<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="{int(width)}" height="{int(math.ceil(height))}" viewBox="0 0 {width:.2f} {height:.2f}">
+  <rect width="100%" height="100%" fill="#ffffff"/>
+  <g>
+    {planned_path}
+    {actual_path}
+    <circle cx="{sx(target_xy[0]):.2f}" cy="{sy(target_xy[1]):.2f}" r="{target_r_px:.2f}" fill="#f97316" fill-opacity="0.18" stroke="#f97316" stroke-width="2"/>
+    {start_marker}
+    {end_marker}
+  </g>
+  <g font-family="Arial, sans-serif" font-size="18" fill="#0f172a">
+    <text x="24" y="34">CARLA trajectory</text>
+    <text x="24" y="60" font-size="14" fill="#475569">blue: recorded ego path, dashed: planned orbit, orange: target</text>
+  </g>
+</svg>
+"""
+    with open(path, "w", encoding="utf-8", newline="\n") as f:
+        f.write(svg)
 
 
 def run_sensor_warmup_and_validation(
@@ -594,6 +685,7 @@ lidar:
   data_format: {rec.yaml_quote("raw float32 row-major Nx6")}
   point_stride_bytes: 24
   fields: ["x", "y", "z", "intensity", "ring", "timestamp"]
+  point_frame_ros: {rec.yaml_quote(str(getattr(args, "lidar_point_frame", "lidar")))}
   timestamp_field: {rec.yaml_quote("absolute CARLA elapsed_seconds of the 100Hz partial packet; constant for points in the same partial")}
   rate_hz: {args.lidar_hz:.9f}
   partial_packet_rate_hz: {1.0 / lidar_tick:.9f}
@@ -692,8 +784,119 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  end_frame: {summary['end_frame']}\n"
     text += f"  end_timestamp: {summary['end_timestamp']:.9f}\n"
     text += f"  orbit_path_file: {rec.yaml_quote('orbit_path.json')}\n"
+    text += f"  trajectory_svg_file: {rec.yaml_quote('trajectory.svg')}\n"
     with open(path, "a", encoding="utf-8", newline="\n") as f:
         f.write(text)
+
+
+def run_preview_only(args: argparse.Namespace, carla: Any, rng: random.Random, world_dt: float) -> None:
+    client = carla.Client(args.host, args.port)
+    client.set_timeout(args.timeout)
+
+    world = None
+    original_settings = None
+    actors: List[Any] = []
+
+    try:
+        world = rec.get_or_load_world(client, args)
+        original_settings = world.get_settings()
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = world_dt
+        world.apply_settings(settings)
+
+        bp_lib = world.get_blueprint_library()
+        ego_bp = pick_exact_vehicle_blueprint(bp_lib, args.ego_blueprint, args.ego_filter, "ego", rng)
+        target_bp = pick_exact_vehicle_blueprint(bp_lib, args.target_blueprint, args.target_filter, "target", rng)
+
+        target_tf = resolve_target_transform(carla, world, args)
+        target = world.try_spawn_actor(target_bp, target_tf)
+        if target is None:
+            raise RuntimeError("failed to spawn target vehicle B at the requested target pose")
+        actors.append(target)
+        try:
+            target.set_simulate_physics(False)
+        except Exception:
+            pass
+
+        orbit_yaw = float(target_tf.rotation.yaw) + float(args.orbit_yaw_offset)
+        orbit_nodes = build_rounded_rectangle_path(carla, target_tf.location, orbit_yaw, args)
+        orbit_cumulative = cumulative_lengths(orbit_nodes)
+        if orbit_cumulative[-1] <= 1e-6:
+            raise RuntimeError("generated orbit path is empty")
+
+        if not args.skip_clearance_check:
+            ok, target_clearance, target_radius = check_target_clearance(target, args)
+            if not ok:
+                raise RuntimeError(
+                    f"target clearance check failed: clearance={target_clearance:.2f}m "
+                    f"target_radius={target_radius:.2f}m required={args.min_target_clearance:.2f}m"
+                )
+        else:
+            _ok, target_clearance, target_radius = check_target_clearance(target, args)
+
+        start_tf = transform_at_distance(carla, orbit_nodes, orbit_cumulative, 0.0, max(0.1, float(args.lookahead_m)))
+        ego = world.try_spawn_actor(ego_bp, start_tf)
+        if ego is None:
+            raise RuntimeError("failed to spawn ego vehicle A at the orbit start pose; choose a clearer target area")
+        actors.append(ego)
+        try:
+            ego.set_simulate_physics(False)
+        except Exception:
+            pass
+
+        target_record_distance = float(orbit_cumulative[-1]) * float(args.orbit_laps)
+        motion_state: Dict[str, Any] = {"distance_m": 0.0}
+        tick_idx = 0
+        last_progress_t = time.time()
+        next_tick_t = time.time()
+
+        print("[PREVIEW] output disabled; no sensors or files will be created")
+        print(
+            f"[SCENARIO] target={target_bp.id} ego={ego_bp.id} "
+            f"path_length={orbit_cumulative[-1]:.1f}m laps={args.orbit_laps:.2f} "
+            f"speed={args.target_speed_kmh:.1f}km/h clearance={target_clearance:.2f}m "
+            f"target_radius={target_radius:.2f}m"
+        )
+
+        while True:
+            orbit_completed = apply_orbit_kinematic(
+                carla, ego, orbit_nodes, orbit_cumulative, motion_state, args, world_dt
+            )
+            world.tick()
+            tick_idx += 1
+
+            now = time.time()
+            if now - last_progress_t >= 2.0:
+                sim_done = tick_idx * world_dt
+                print(
+                    f"[PREVIEW] sim={sim_done:.2f}s "
+                    f"orbit_dist={float(motion_state.get('distance_m', 0.0)):.1f}/{target_record_distance:.1f}m"
+                )
+                last_progress_t = now
+
+            if orbit_completed:
+                break
+
+            next_tick_t += world_dt
+            sleep_s = next_tick_t - time.time()
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+
+    finally:
+        for actor in reversed(actors):
+            try:
+                actor.destroy()
+            except Exception:
+                pass
+
+        try:
+            if world is not None and original_settings is not None:
+                world.apply_settings(original_settings)
+        except Exception:
+            pass
+
+    print("[DONE] preview finalized")
 
 
 def main() -> None:
@@ -705,6 +908,10 @@ def main() -> None:
     carla = rec.import_carla_or_exit(args.carla_root)
 
     world_dt = float(args.fixed_dt)
+    if args.preview_only:
+        run_preview_only(args, carla, rng, world_dt)
+        return
+
     camera_ticks = 0 if args.no_camera else rec.ensure_integer_period_ticks("camera", args.camera_hz, world_dt)
     lidar_sweep_ticks = rec.ensure_integer_period_ticks("lidar", args.lidar_hz, world_dt)
     imu_ticks = rec.ensure_integer_period_ticks("imu", args.imu_hz, world_dt)
@@ -882,6 +1089,8 @@ def main() -> None:
             args.lidar_channels,
             args.lidar_lower_fov,
             args.lidar_upper_fov,
+            point_frame=args.lidar_point_frame,
+            sensor_xyz_ros=(args.lidar_x, -args.lidar_y, args.lidar_z),
             max_queue=args.max_writer_queue,
         )
         imu_writer = rec.ImuWriter(os.path.join(imu_dir, "data"), max_queue=args.max_writer_queue)
@@ -955,6 +1164,7 @@ def main() -> None:
         last_progress_t = time.time()
         record_start_wall = time.time()
         motion_state: Dict[str, Any] = {"distance_m": 0.0}
+        trajectory_samples: List[Dict[str, float]] = []
         target_record_distance = float(orbit_cumulative[-1]) * float(args.orbit_laps)
 
         while True:
@@ -966,6 +1176,18 @@ def main() -> None:
             tick_idx += 1
             last_world_frame = world_frame
             last_sim_timestamp = float(world.get_snapshot().timestamp.elapsed_seconds)
+            ego_tf = ego.get_transform()
+            trajectory_samples.append(
+                {
+                    "frame": float(world_frame),
+                    "timestamp": last_sim_timestamp,
+                    "distance_m": float(motion_state.get("distance_m", 0.0)),
+                    "x": float(ego_tf.location.x),
+                    "y": float(ego_tf.location.y),
+                    "z": float(ego_tf.location.z),
+                    "yaw": float(ego_tf.rotation.yaw),
+                }
+            )
 
             imu_meas = imu_buf.wait(world_frame, args.wait_timeout)
             if imu_meas is None:
@@ -1049,6 +1271,15 @@ def main() -> None:
             print(f"[WARN] dropping incomplete LiDAR sweep with {len(lidar_packets)} partial packets")
 
         end_tf = ego.get_transform()
+        trajectory_svg_path = os.path.join(out_dir, "trajectory.svg")
+        save_trajectory_svg(
+            trajectory_svg_path,
+            trajectory_samples,
+            orbit_nodes,
+            target_tf.location,
+            target_radius,
+        )
+        print(f"[DONE] trajectory svg: {trajectory_svg_path}")
         append_scenario_summary(
             meta_path,
             {

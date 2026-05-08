@@ -371,10 +371,10 @@ Dual-vehicle tracking script:
   - B defaults to a figure-eight path inside its zone.
   - `--shared-area` disables zone separation when intentionally needed.
 - Before recording, sampled A/B trajectories are checked against `max(--min-separation, ego_radius + target_radius + --collision-margin)`. If the sampled planned paths are too close, the script fails before recording.
-- Main controls include `--area-length`, `--area-width`, `--area-spawn-index`, explicit `--area-center-x/y/z`, `--duration`, `--ego-speed-kmh`, `--target-speed-kmh`, `--min-separation`, `--max-separation`, `--zone-gap`, and `--collision-margin`.
+- Main controls include `--area-length`, `--area-width`, `--area-spawn-index`, explicit `--area-center-x/y/z`, `--duration`, `--stationary-start-duration`, `--ego-speed-kmh`, `--target-speed-kmh`, `--min-separation`, `--max-separation`, `--zone-gap`, and `--collision-margin`.
 - Writes normal camera/LiDAR/IMU streams from A.
 - Writes B ground truth at every world tick to `target_pose/data.csv`.
-  - Includes A world pose, B world pose, relative B position in A's ROS-style body axes, distance, bearing, and relative yaw.
+  - Includes A world pose, B world pose, and relative B pose using position plus quaternion columns.
 - Saves `scenario_paths.json` plus a `scenario:` section in `meta.yaml`.
 - Marks the dataset invalid if sensor sync fails, LiDAR partials are dropped, A/B violate min/max separation, or either vehicle leaves the configured area bounds.
 - Curated Town10HD config currently available:

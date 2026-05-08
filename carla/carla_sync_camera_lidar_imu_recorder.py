@@ -257,12 +257,18 @@ def build_lidar_xyzir_timestamp(
     channels: int,
     lower_fov: float,
     upper_fov: float,
+    point_frame: str = "lidar",
+    sensor_xyz_ros: Sequence[float] = (0.0, 0.0, 0.0),
 ) -> Tuple[array.array, int]:
     """Build float32 [x, y, z, intensity, ring, timestamp] in ROS body axes."""
     out = array.array("f")
     fov_span = max(1e-6, upper_fov - lower_fov)
     max_ring = max(0, channels - 1)
     point_count = 0
+    sensor_x = float(sensor_xyz_ros[0]) if len(sensor_xyz_ros) > 0 else 0.0
+    sensor_y = float(sensor_xyz_ros[1]) if len(sensor_xyz_ros) > 1 else 0.0
+    sensor_z = float(sensor_xyz_ros[2]) if len(sensor_xyz_ros) > 2 else 0.0
+    write_base_link = point_frame == "base_link"
 
     for raw_bytes, packet_ts, _frame in packets:
         vals = array_from_lidar_raw(raw_bytes)
@@ -282,9 +288,17 @@ def build_lidar_xyzir_timestamp(
             elif ring > max_ring:
                 ring = max_ring
 
-            out.append(float(x))
-            out.append(float(-y_carla))
-            out.append(float(z))
+            x_ros = float(x)
+            y_ros = float(-y_carla)
+            z_ros = float(z)
+            if write_base_link:
+                x_ros += sensor_x
+                y_ros += sensor_y
+                z_ros += sensor_z
+
+            out.append(x_ros)
+            out.append(y_ros)
+            out.append(z_ros)
             out.append(float(intensity))
             out.append(float(ring))
             out.append(ts_f)
@@ -419,10 +433,25 @@ class ImuWriter(BaseWriter):
 
 
 class LidarWriter(BaseWriter):
-    def __init__(self, out_dir: str, channels: int, lower_fov: float, upper_fov: float, max_queue: int = 128):
+    def __init__(
+        self,
+        out_dir: str,
+        channels: int,
+        lower_fov: float,
+        upper_fov: float,
+        point_frame: str = "lidar",
+        sensor_xyz_ros: Sequence[float] = (0.0, 0.0, 0.0),
+        max_queue: int = 128,
+    ):
         self.channels = channels
         self.lower_fov = lower_fov
         self.upper_fov = upper_fov
+        if point_frame not in ("lidar", "base_link"):
+            raise ValueError(f"unsupported LiDAR point frame: {point_frame}")
+        self.point_frame = point_frame
+        self.sensor_xyz_ros = tuple(float(v) for v in sensor_xyz_ros[:3])
+        if len(self.sensor_xyz_ros) != 3:
+            raise ValueError("sensor_xyz_ros must contain exactly three values")
         self.last_point_count = 0
         super().__init__(out_dir, max_queue=max_queue)
 
@@ -433,7 +462,12 @@ class LidarWriter(BaseWriter):
                 return
             seq, packets = item
             cloud, point_count = build_lidar_xyzir_timestamp(
-                packets, self.channels, self.lower_fov, self.upper_fov
+                packets,
+                self.channels,
+                self.lower_fov,
+                self.upper_fov,
+                self.point_frame,
+                self.sensor_xyz_ros,
             )
             path = os.path.join(self.out_dir, f"{seq:06d}.bin")
             with open(path, "wb") as f:
@@ -590,6 +624,7 @@ lidar:
   data_format: {yaml_quote("raw float32 row-major Nx6")}
   point_stride_bytes: 24
   fields: ["x", "y", "z", "intensity", "ring", "timestamp"]
+  point_frame_ros: {yaml_quote(str(getattr(args, "lidar_point_frame", "lidar")))}
   timestamp_field: {yaml_quote("absolute CARLA elapsed_seconds of the 100Hz partial packet; constant for points in the same partial")}
   rate_hz: {args.lidar_hz:.9f}
   partial_packet_rate_hz: {1.0 / lidar_tick:.9f}
@@ -706,6 +741,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lidar-x", type=float, default=0.0)
     ap.add_argument("--lidar-y", type=float, default=0.0)
     ap.add_argument("--lidar-z", type=float, default=1.9)
+    ap.add_argument(
+        "--lidar-point-frame",
+        choices=["lidar", "base_link"],
+        default="lidar",
+        help="Coordinate frame used for saved LiDAR XYZ points. Default preserves raw sensor-frame output.",
+    )
 
     ap.add_argument("--imu-hz", type=float, default=100.0)
     ap.add_argument("--imu-x", type=float, default=0.0)
@@ -1655,6 +1696,8 @@ def main() -> None:
             args.lidar_channels,
             args.lidar_lower_fov,
             args.lidar_upper_fov,
+            point_frame=args.lidar_point_frame,
+            sensor_xyz_ros=(args.lidar_x, -args.lidar_y, args.lidar_z),
             max_queue=args.max_writer_queue,
         )
         imu_writer = ImuWriter(os.path.join(imu_dir, "data"), max_queue=args.max_writer_queue)

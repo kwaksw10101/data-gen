@@ -91,6 +91,12 @@ Override one config value from CLI:
 C:\Users\kwaks\AppData\Local\Programs\Python\Python312\python.exe carla\carla_dual_vehicle_tracking_recorder.py --config carla\configs\town10_dual_tracking_pos137.json --duration 40 --run-name dual_town10_40s
 ```
 
+Record the first 5 seconds after warmup with both vehicles stopped:
+
+```powershell
+C:\Users\kwaks\AppData\Local\Programs\Python\Python312\python.exe carla\carla_dual_vehicle_tracking_recorder.py --config carla\configs\town10_dual_tracking_pos137.json --stationary-start-duration 5
+```
+
 This mode also writes target ground truth:
 
 ```text
@@ -126,6 +132,16 @@ route-loop timeout:      disabled by default
 warmup timeout:          10 s
 route IMU mode:          synthetic
 ```
+
+## LiDAR Point Frame
+
+All three recorder scripts support `--lidar-point-frame {lidar,base_link}`.
+
+```powershell
+C:\Users\kwaks\AppData\Local\Programs\Python\Python312\python.exe carla\carla_dual_vehicle_tracking_recorder.py --config carla\configs\town10_dual_tracking_pos137.json --lidar-point-frame base_link
+```
+
+The default is `lidar`, which preserves the previous saved BIN convention. Use `base_link` to save LiDAR point XYZ in the ego vehicle frame. The selected frame is written to `meta.yaml` as `lidar.point_frame_ros`.
 
 ## Output
 

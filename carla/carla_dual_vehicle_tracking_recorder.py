@@ -39,6 +39,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--duration", type=float, default=20.0)
+    ap.add_argument(
+        "--stationary-start-duration",
+        type=float,
+        default=0.0,
+        help="Simulation seconds to record with both vehicles stopped after warmup and before moving",
+    )
 
     ap.add_argument("--warmup-ticks", type=int, default=20)
     ap.add_argument("--warmup-min-ticks", type=int, default=50)
@@ -70,6 +76,12 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lidar-x", type=float, default=0.0)
     ap.add_argument("--lidar-y", type=float, default=0.0)
     ap.add_argument("--lidar-z", type=float, default=1.9)
+    ap.add_argument(
+        "--lidar-point-frame",
+        choices=["lidar", "base_link"],
+        default="lidar",
+        help="Coordinate frame used for saved LiDAR XYZ points. Default preserves raw sensor-frame output.",
+    )
 
     ap.add_argument("--imu-hz", type=float, default=100.0)
     ap.add_argument("--imu-x", type=float, default=0.0)
@@ -96,8 +108,8 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--collision-margin", type=float, default=1.0, help="Added to actor bounding radii for separation checks")
     ap.add_argument("--separation-check-samples", type=int, default=720)
 
-    ap.add_argument("--ego-speed-kmh", type=float, default=15.0)
-    ap.add_argument("--target-speed-kmh", type=float, default=10.0)
+    ap.add_argument("--ego-speed-kmh", type=float, default=7.0)
+    ap.add_argument("--target-speed-kmh", type=float, default=7.0)
     ap.add_argument("--ego-trajectory", choices=["rounded-rectangle"], default="rounded-rectangle")
     ap.add_argument("--target-trajectory", choices=["figure-eight", "rounded-rectangle"], default="figure-eight")
     ap.add_argument("--ego-path-half-length", type=float, default=None)
@@ -385,6 +397,15 @@ def synthetic_imu_values(meas: Any, state: Dict[str, Any]) -> array.array:
     )
 
 
+def hold_actor_kinematic_stopped(carla: Any, actor: Any, tf: Any) -> None:
+    actor.set_transform(tf)
+    try:
+        actor.set_target_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+        actor.set_target_angular_velocity(carla.Vector3D(0.0, 0.0, 0.0))
+    except Exception:
+        pass
+
+
 def pose_in_area_bounds(tf: Any, area_tf: Any, args: argparse.Namespace) -> bool:
     dx = float(tf.location.x) - float(area_tf.location.x)
     dy = float(tf.location.y) - float(area_tf.location.y)
@@ -421,6 +442,66 @@ def min_sampled_path_separation(
     return min_sep
 
 
+def rotation_matrix_carla_to_ros(rotation: Any) -> List[List[float]]:
+    roll = math.radians(float(rotation.roll))
+    pitch = math.radians(float(rotation.pitch))
+    yaw = math.radians(float(rotation.yaw))
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+
+    # CARLA uses x-forward, y-right, z-up. Convert the rotation into the
+    # recorder's ROS-style body axes: x-forward, y-left, z-up.
+    carla_matrix = [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+    return [
+        [carla_matrix[0][0], -carla_matrix[0][1], carla_matrix[0][2]],
+        [-carla_matrix[1][0], carla_matrix[1][1], -carla_matrix[1][2]],
+        [carla_matrix[2][0], -carla_matrix[2][1], carla_matrix[2][2]],
+    ]
+
+
+def matmul_transpose_a(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> List[List[float]]:
+    return [
+        [sum(float(a[k][i]) * float(b[k][j]) for k in range(3)) for j in range(3)]
+        for i in range(3)
+    ]
+
+
+def quaternion_from_matrix(m: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
+    trace = float(m[0][0]) + float(m[1][1]) + float(m[2][2])
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (float(m[2][1]) - float(m[1][2])) / s
+        qy = (float(m[0][2]) - float(m[2][0])) / s
+        qz = (float(m[1][0]) - float(m[0][1])) / s
+    elif float(m[0][0]) > float(m[1][1]) and float(m[0][0]) > float(m[2][2]):
+        s = math.sqrt(1.0 + float(m[0][0]) - float(m[1][1]) - float(m[2][2])) * 2.0
+        qw = (float(m[2][1]) - float(m[1][2])) / s
+        qx = 0.25 * s
+        qy = (float(m[0][1]) + float(m[1][0])) / s
+        qz = (float(m[0][2]) + float(m[2][0])) / s
+    elif float(m[1][1]) > float(m[2][2]):
+        s = math.sqrt(1.0 + float(m[1][1]) - float(m[0][0]) - float(m[2][2])) * 2.0
+        qw = (float(m[0][2]) - float(m[2][0])) / s
+        qx = (float(m[0][1]) + float(m[1][0])) / s
+        qy = 0.25 * s
+        qz = (float(m[1][2]) + float(m[2][1])) / s
+    else:
+        s = math.sqrt(1.0 + float(m[2][2]) - float(m[0][0]) - float(m[1][1])) * 2.0
+        qw = (float(m[1][0]) - float(m[0][1])) / s
+        qx = (float(m[0][2]) + float(m[2][0])) / s
+        qy = (float(m[1][2]) + float(m[2][1])) / s
+        qz = 0.25 * s
+
+    norm = max(1e-12, math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw))
+    return qx / norm, qy / norm, qz / norm, qw / norm
+
+
 def relative_target_pose(ego_tf: Any, target_tf: Any) -> Dict[str, float]:
     dx = float(target_tf.location.x) - float(ego_tf.location.x)
     dy = float(target_tf.location.y) - float(ego_tf.location.y)
@@ -428,41 +509,45 @@ def relative_target_pose(ego_tf: Any, target_tf: Any) -> Dict[str, float]:
     yaw = math.radians(float(ego_tf.rotation.yaw))
     c = math.cos(yaw)
     s = math.sin(yaw)
-    x_forward = dx * c + dy * s
+    rel_x = dx * c + dy * s
     y_right = -dx * s + dy * c
-    y_left = -y_right
-    distance = math.sqrt(dx * dx + dy * dy + dz * dz)
-    bearing_ros_deg = math.degrees(math.atan2(y_left, x_forward))
-    yaw_rel = rec.wrap_deg(float(target_tf.rotation.yaw) - float(ego_tf.rotation.yaw))
+    rel_y = -y_right
+    rel_z = dz
+    ego_rot = rotation_matrix_carla_to_ros(ego_tf.rotation)
+    target_rot = rotation_matrix_carla_to_ros(target_tf.rotation)
+    qx, qy, qz, qw = quaternion_from_matrix(matmul_transpose_a(ego_rot, target_rot))
     return {
-        "x_forward": x_forward,
-        "y_left": y_left,
-        "z_up": dz,
-        "distance": distance,
-        "bearing_ros_deg": bearing_ros_deg,
-        "target_yaw_relative_deg": yaw_rel,
+        "x": rel_x,
+        "y": rel_y,
+        "z": rel_z,
+        "qx": qx,
+        "qy": qy,
+        "qz": qz,
+        "qw": qw,
     }
 
 
 def write_pose_header(f: Any) -> None:
     f.write(
         "seq,timestamp_seconds,carla_frame,"
-        "ego_x,ego_y,ego_z,ego_roll,ego_pitch,ego_yaw,"
-        "target_x,target_y,target_z,target_roll,target_pitch,target_yaw,"
-        "rel_x_forward,rel_y_left,rel_z_up,distance,bearing_ros_deg,target_yaw_relative_deg\n"
+        "ego_x,ego_y,ego_z,ego_qx,ego_qy,ego_qz,ego_qw,"
+        "target_x,target_y,target_z,target_qx,target_qy,target_qz,target_qw,"
+        "rel_x,rel_y,rel_z,rel_qx,rel_qy,rel_qz,rel_qw\n"
     )
 
 
 def write_pose_row(f: Any, seq: int, timestamp: float, frame: int, ego_tf: Any, target_tf: Any) -> None:
     rel = relative_target_pose(ego_tf, target_tf)
+    ego_qx, ego_qy, ego_qz, ego_qw = quaternion_from_matrix(rotation_matrix_carla_to_ros(ego_tf.rotation))
+    target_qx, target_qy, target_qz, target_qw = quaternion_from_matrix(rotation_matrix_carla_to_ros(target_tf.rotation))
     f.write(
         f"{seq},{timestamp:.9f},{frame},"
         f"{ego_tf.location.x:.9f},{ego_tf.location.y:.9f},{ego_tf.location.z:.9f},"
-        f"{ego_tf.rotation.roll:.9f},{ego_tf.rotation.pitch:.9f},{ego_tf.rotation.yaw:.9f},"
+        f"{ego_qx:.9f},{ego_qy:.9f},{ego_qz:.9f},{ego_qw:.9f},"
         f"{target_tf.location.x:.9f},{target_tf.location.y:.9f},{target_tf.location.z:.9f},"
-        f"{target_tf.rotation.roll:.9f},{target_tf.rotation.pitch:.9f},{target_tf.rotation.yaw:.9f},"
-        f"{rel['x_forward']:.9f},{rel['y_left']:.9f},{rel['z_up']:.9f},"
-        f"{rel['distance']:.9f},{rel['bearing_ros_deg']:.9f},{rel['target_yaw_relative_deg']:.9f}\n"
+        f"{target_qx:.9f},{target_qy:.9f},{target_qz:.9f},{target_qw:.9f},"
+        f"{rel['x']:.9f},{rel['y']:.9f},{rel['z']:.9f},"
+        f"{rel['qx']:.9f},{rel['qy']:.9f},{rel['qz']:.9f},{rel['qw']:.9f}\n"
     )
 
 
@@ -510,6 +595,7 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  target_trajectory: {rec.yaml_quote(summary['target_trajectory'])}\n"
     text += f"  ego_speed_kmh: {summary['ego_speed_kmh']:.9f}\n"
     text += f"  target_speed_kmh: {summary['target_speed_kmh']:.9f}\n"
+    text += f"  stationary_start_duration_s: {summary['stationary_start_duration_s']:.9f}\n"
     text += f"  duration_s: {summary['duration_s']:.9f}\n"
     text += f"  start_frame: {summary['start_frame']}\n"
     text += f"  start_timestamp: {summary['start_timestamp']:.9f}\n"
@@ -525,6 +611,8 @@ def main() -> None:
     args = parse_args_with_config()
     if args.duration <= 0.0:
         raise ValueError("--duration must be positive for this recorder")
+    if args.stationary_start_duration < 0.0:
+        raise ValueError("--stationary-start-duration must be non-negative")
     if args.min_separation < 0.0 or args.max_separation <= args.min_separation:
         raise ValueError("--max-separation must be greater than --min-separation")
 
@@ -733,6 +821,8 @@ def main() -> None:
             args.lidar_channels,
             args.lidar_lower_fov,
             args.lidar_upper_fov,
+            point_frame=args.lidar_point_frame,
+            sensor_xyz_ros=(args.lidar_x, -args.lidar_y, args.lidar_z),
             max_queue=args.max_writer_queue,
         )
         imu_writer = rec.ImuWriter(os.path.join(imu_dir, "data"), max_queue=args.max_writer_queue)
@@ -809,6 +899,7 @@ def main() -> None:
         tick_idx = 0
         raw_target_ticks = max(1, int(math.ceil(float(args.duration) / world_dt)))
         target_ticks = int(math.ceil(raw_target_ticks / lidar_sweep_ticks) * lidar_sweep_ticks)
+        stationary_ticks = min(target_ticks, int(math.ceil(float(args.stationary_start_duration) / world_dt)))
         lidar_packets: List[Tuple[bytes, float, int]] = []
         last_progress_t = time.time()
         record_start_wall = time.time()
@@ -816,20 +907,27 @@ def main() -> None:
         target_state: Dict[str, Any] = {"distance_m": float(args.target_phase_m)}
 
         while tick_idx < target_ticks:
-            ego_tf = apply_kinematic_actor(
-                carla, ego, ego_nodes, ego_cumulative, ego_state, args.ego_speed_kmh, args.lookahead_m, world_dt
-            )
-            target_tf = apply_kinematic_actor(
-                carla,
-                target,
-                target_nodes,
-                target_cumulative,
-                target_state,
-                args.target_speed_kmh,
-                args.lookahead_m,
-                world_dt,
-            )
-            update_ego_synthetic_imu(ego_state, ego_tf, args.ego_speed_kmh, world_dt)
+            if tick_idx < stationary_ticks:
+                ego_tf = ego_start_tf
+                target_tf = target_start_tf
+                hold_actor_kinematic_stopped(carla, ego, ego_tf)
+                hold_actor_kinematic_stopped(carla, target, target_tf)
+                update_ego_synthetic_imu(ego_state, ego_tf, 0.0, world_dt)
+            else:
+                ego_tf = apply_kinematic_actor(
+                    carla, ego, ego_nodes, ego_cumulative, ego_state, args.ego_speed_kmh, args.lookahead_m, world_dt
+                )
+                target_tf = apply_kinematic_actor(
+                    carla,
+                    target,
+                    target_nodes,
+                    target_cumulative,
+                    target_state,
+                    args.target_speed_kmh,
+                    args.lookahead_m,
+                    world_dt,
+                )
+                update_ego_synthetic_imu(ego_state, ego_tf, args.ego_speed_kmh, world_dt)
 
             world_frame = int(world.tick())
             tick_idx += 1
@@ -838,7 +936,7 @@ def main() -> None:
             last_sim_timestamp = float(snapshot.timestamp.elapsed_seconds)
 
             rel = relative_target_pose(ego_tf, target_tf)
-            sep = float(rel["distance"])
+            sep = math.sqrt(float(rel["x"]) ** 2 + float(rel["y"]) ** 2 + float(rel["z"]) ** 2)
             min_observed_sep = min(min_observed_sep, sep)
             max_observed_sep = max(max_observed_sep, sep)
             if sep < required_center_sep:
@@ -909,7 +1007,7 @@ def main() -> None:
                 print(
                     f"[REC] sim={sim_done:.2f}s wall={wall_elapsed:.2f}s "
                     f"camera={'off' if args.no_camera else seq_camera} lidar={seq_lidar} imu={seq_imu} pose={seq_pose} "
-                    f"sep={sep:.1f}m"
+                    f"sep={sep:.1f}m phase={'stationary' if tick_idx <= stationary_ticks else 'moving'}"
                 )
                 last_progress_t = now
 
@@ -952,6 +1050,7 @@ def main() -> None:
                 "target_trajectory": args.target_trajectory,
                 "ego_speed_kmh": float(args.ego_speed_kmh),
                 "target_speed_kmh": float(args.target_speed_kmh),
+                "stationary_start_duration_s": min(float(args.stationary_start_duration), tick_idx * world_dt),
                 "duration_s": tick_idx * world_dt,
                 "start_frame": start_frame,
                 "start_timestamp": start_timestamp,
