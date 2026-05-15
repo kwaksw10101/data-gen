@@ -63,7 +63,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lidar-sweep-points", type=int, default=65000)
     ap.add_argument("--lidar-pps", type=int, default=0)
     ap.add_argument("--lidar-channels", type=int, default=64)
-    ap.add_argument("--lidar-lower-fov", type=float, default=-5.0)
+    ap.add_argument("--lidar-lower-fov", type=float, default=-10.0)
     ap.add_argument("--lidar-upper-fov", type=float, default=15.0)
     ap.add_argument("--lidar-horizontal-fov", type=float, default=360.0)
     ap.add_argument("--lidar-range", type=float, default=100.0)
@@ -502,6 +502,75 @@ def save_trajectory_svg(
         f.write(svg)
 
 
+def rotation_matrix_carla_to_ros(rotation: Any) -> List[List[float]]:
+    roll = math.radians(float(rotation.roll))
+    pitch = math.radians(float(rotation.pitch))
+    yaw = math.radians(float(rotation.yaw))
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+
+    carla_matrix = [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+    return [
+        [carla_matrix[0][0], -carla_matrix[0][1], carla_matrix[0][2]],
+        [-carla_matrix[1][0], carla_matrix[1][1], -carla_matrix[1][2]],
+        [carla_matrix[2][0], -carla_matrix[2][1], carla_matrix[2][2]],
+    ]
+
+
+def location_carla_to_ros(location: Any) -> Tuple[float, float, float]:
+    return float(location.x), -float(location.y), float(location.z)
+
+
+def quaternion_from_matrix(m: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
+    trace = float(m[0][0]) + float(m[1][1]) + float(m[2][2])
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (float(m[2][1]) - float(m[1][2])) / s
+        qy = (float(m[0][2]) - float(m[2][0])) / s
+        qz = (float(m[1][0]) - float(m[0][1])) / s
+    elif float(m[0][0]) > float(m[1][1]) and float(m[0][0]) > float(m[2][2]):
+        s = math.sqrt(1.0 + float(m[0][0]) - float(m[1][1]) - float(m[2][2])) * 2.0
+        qw = (float(m[2][1]) - float(m[1][2])) / s
+        qx = 0.25 * s
+        qy = (float(m[0][1]) + float(m[1][0])) / s
+        qz = (float(m[0][2]) + float(m[2][0])) / s
+    elif float(m[1][1]) > float(m[2][2]):
+        s = math.sqrt(1.0 + float(m[1][1]) - float(m[0][0]) - float(m[2][2])) * 2.0
+        qw = (float(m[0][2]) - float(m[2][0])) / s
+        qx = (float(m[0][1]) + float(m[1][0])) / s
+        qy = 0.25 * s
+        qz = (float(m[1][2]) + float(m[2][1])) / s
+    else:
+        s = math.sqrt(1.0 + float(m[2][2]) - float(m[0][0]) - float(m[1][1])) * 2.0
+        qw = (float(m[1][0]) - float(m[0][1])) / s
+        qx = (float(m[0][2]) + float(m[2][0])) / s
+        qy = (float(m[1][2]) + float(m[2][1])) / s
+        qz = 0.25 * s
+
+    norm = max(1e-12, math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw))
+    return qx / norm, qy / norm, qz / norm, qw / norm
+
+
+def write_ego_pose_header(f: Any) -> None:
+    f.write("seq,timestamp_seconds,carla_frame,x,y,z,qx,qy,qz,qw\n")
+
+
+def write_ego_pose_row(f: Any, seq: int, timestamp: float, frame: int, ego_tf: Any) -> None:
+    x, y, z = location_carla_to_ros(ego_tf.location)
+    qx, qy, qz, qw = quaternion_from_matrix(rotation_matrix_carla_to_ros(ego_tf.rotation))
+    f.write(
+        f"{seq},{timestamp:.9f},{frame},"
+        f"{x:.9f},{y:.9f},{z:.9f},"
+        f"{qx:.9f},{qy:.9f},{qz:.9f},{qw:.9f}\n"
+    )
+
+
 def run_sensor_warmup_and_validation(
     carla: Any,
     world: Any,
@@ -638,7 +707,7 @@ def write_meta(
         )
         return
 
-    spawn = rec.transform_to_dict(spawn_tf)
+    spawn = rec.transform_carla_to_ros_dict(spawn_tf)
     lidar_tf_ros = rec.ros_transform_from_carla_location(args.lidar_x, args.lidar_y, args.lidar_z)
     imu_tf_ros = rec.ros_transform_from_carla_location(args.imu_x, args.imu_y, args.imu_z)
     lidar_to_imu_tf_ros = rec.relative_ros_transform(lidar_tf_ros, imu_tf_ros)
@@ -654,13 +723,14 @@ carla:
   server_version: {rec.yaml_quote(server_version)}
   map: {rec.yaml_quote(map_name)}
   vehicle_blueprint: {rec.yaml_quote(vehicle_id)}
-  spawn_carla:
+  spawn_ros:
     x: {spawn["x"]:.9f}
     y: {spawn["y"]:.9f}
     z: {spawn["z"]:.9f}
-    roll: {spawn["roll"]:.9f}
-    pitch: {spawn["pitch"]:.9f}
-    yaw: {spawn["yaw"]:.9f}
+    qx: {spawn["qx"]:.9f}
+    qy: {spawn["qy"]:.9f}
+    qz: {spawn["qz"]:.9f}
+    qw: {spawn["qw"]:.9f}
 
 world:
   synchronous_mode: true
@@ -757,9 +827,11 @@ sensor_pair:
 
 def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     def pose(tf: Any) -> str:
+        pose_ros = rec.transform_carla_to_ros_dict(tf)
         return (
-            f"{{x: {tf.location.x:.9f}, y: {tf.location.y:.9f}, z: {tf.location.z:.9f}, "
-            f"roll: {tf.rotation.roll:.9f}, pitch: {tf.rotation.pitch:.9f}, yaw: {tf.rotation.yaw:.9f}}}"
+            f"{{x: {pose_ros['x']:.9f}, y: {pose_ros['y']:.9f}, z: {pose_ros['z']:.9f}, "
+            f"qx: {pose_ros['qx']:.9f}, qy: {pose_ros['qy']:.9f}, "
+            f"qz: {pose_ros['qz']:.9f}, qw: {pose_ros['qw']:.9f}}}"
         )
 
     text = "\nscenario:\n"
@@ -767,9 +839,9 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  completed: {str(bool(summary['completed'])).lower()}\n"
     text += f"  ego_blueprint: {rec.yaml_quote(summary['ego_blueprint'])}\n"
     text += f"  target_blueprint: {rec.yaml_quote(summary['target_blueprint'])}\n"
-    text += f"  target_pose_carla: {pose(summary['target_pose_carla'])}\n"
-    text += f"  ego_start_pose_carla: {pose(summary['ego_start_pose_carla'])}\n"
-    text += f"  ego_end_pose_carla: {pose(summary['ego_end_pose_carla'])}\n"
+    text += f"  target_pose_ros: {pose(summary['target_pose_ros'])}\n"
+    text += f"  ego_start_pose_ros: {pose(summary['ego_start_pose_ros'])}\n"
+    text += f"  ego_end_pose_ros: {pose(summary['ego_end_pose_ros'])}\n"
     text += f"  orbit_half_length_m: {summary['orbit_half_length_m']:.9f}\n"
     text += f"  orbit_half_width_m: {summary['orbit_half_width_m']:.9f}\n"
     text += f"  corner_radius_m: {summary['corner_radius_m']:.9f}\n"
@@ -783,6 +855,7 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  start_timestamp: {summary['start_timestamp']:.9f}\n"
     text += f"  end_frame: {summary['end_frame']}\n"
     text += f"  end_timestamp: {summary['end_timestamp']:.9f}\n"
+    text += f"  ego_pose_file: {rec.yaml_quote('ego_pose/data.csv')}\n"
     text += f"  orbit_path_file: {rec.yaml_quote('orbit_path.json')}\n"
     text += f"  trajectory_svg_file: {rec.yaml_quote('trajectory.svg')}\n"
     with open(path, "a", encoding="utf-8", newline="\n") as f:
@@ -927,7 +1000,8 @@ def main() -> None:
     out_dir = os.path.abspath(os.path.join(args.out_root, run_name))
     lidar_dir = os.path.join(out_dir, "lidar")
     imu_dir = os.path.join(out_dir, "imu")
-    dirs = [os.path.join(lidar_dir, "data"), os.path.join(imu_dir, "data")]
+    ego_pose_dir = os.path.join(out_dir, "ego_pose")
+    dirs = [os.path.join(lidar_dir, "data"), os.path.join(imu_dir, "data"), ego_pose_dir]
     if not args.no_camera:
         camera_dir = os.path.join(out_dir, "camera")
         dirs.insert(0, os.path.join(camera_dir, "data"))
@@ -948,6 +1022,7 @@ def main() -> None:
     f_cam_ts = None
     f_lidar_ts = None
     f_imu_ts = None
+    f_ego_pose = None
 
     camera_stamps: List[float] = []
     lidar_stamps: List[float] = []
@@ -1117,6 +1192,8 @@ def main() -> None:
             os.path.join(imu_dir, "timestamps.csv"),
             ("seq", "timestamp_seconds", "carla_frame"),
         )
+        f_ego_pose = open(os.path.join(ego_pose_dir, "data.csv"), "w", encoding="ascii", buffering=1)
+        write_ego_pose_header(f_ego_pose)
 
         print(f"[RUN] output: {out_dir}")
         print(
@@ -1159,6 +1236,7 @@ def main() -> None:
         seq_camera = 0
         seq_lidar = 0
         seq_imu = 0
+        seq_ego_pose = 0
         tick_idx = 0
         lidar_packets: List[Tuple[bytes, float, int]] = []
         last_progress_t = time.time()
@@ -1177,6 +1255,8 @@ def main() -> None:
             last_world_frame = world_frame
             last_sim_timestamp = float(world.get_snapshot().timestamp.elapsed_seconds)
             ego_tf = ego.get_transform()
+            write_ego_pose_row(f_ego_pose, seq_ego_pose, last_sim_timestamp, world_frame, ego_tf)
+            seq_ego_pose += 1
             trajectory_samples.append(
                 {
                     "frame": float(world_frame),
@@ -1286,9 +1366,9 @@ def main() -> None:
                 "completed": orbit_completed,
                 "ego_blueprint": ego_bp.id,
                 "target_blueprint": target_bp.id,
-                "target_pose_carla": target_tf,
-                "ego_start_pose_carla": start_tf,
-                "ego_end_pose_carla": end_tf,
+                "target_pose_ros": target_tf,
+                "ego_start_pose_ros": start_tf,
+                "ego_end_pose_ros": end_tf,
                 "orbit_half_length_m": float(args.orbit_half_length),
                 "orbit_half_width_m": float(args.orbit_half_width),
                 "corner_radius_m": float(args.corner_radius),
@@ -1340,7 +1420,7 @@ def main() -> None:
                 except Exception as exc:
                     close_errors.append(str(exc))
 
-        for f in (f_cam_ts, f_lidar_ts, f_imu_ts):
+        for f in (f_cam_ts, f_lidar_ts, f_imu_ts, f_ego_pose):
             try:
                 if f is not None:
                     f.close()

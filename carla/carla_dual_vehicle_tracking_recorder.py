@@ -39,6 +39,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--run-name", default=None)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--duration", type=float, default=20.0)
+    ap.add_argument("--preview-only", action="store_true", help="Spawn ego/target and run the scenario without sensors or file output")
     ap.add_argument(
         "--stationary-start-duration",
         type=float,
@@ -69,7 +70,7 @@ def make_arg_parser() -> argparse.ArgumentParser:
     ap.add_argument("--lidar-sweep-points", type=int, default=65000)
     ap.add_argument("--lidar-pps", type=int, default=0)
     ap.add_argument("--lidar-channels", type=int, default=64)
-    ap.add_argument("--lidar-lower-fov", type=float, default=-5.0)
+    ap.add_argument("--lidar-lower-fov", type=float, default=-10.0)
     ap.add_argument("--lidar-upper-fov", type=float, default=15.0)
     ap.add_argument("--lidar-horizontal-fov", type=float, default=360.0)
     ap.add_argument("--lidar-range", type=float, default=100.0)
@@ -464,6 +465,10 @@ def rotation_matrix_carla_to_ros(rotation: Any) -> List[List[float]]:
     ]
 
 
+def location_carla_to_ros(location: Any) -> Tuple[float, float, float]:
+    return float(location.x), -float(location.y), float(location.z)
+
+
 def matmul_transpose_a(a: Sequence[Sequence[float]], b: Sequence[Sequence[float]]) -> List[List[float]]:
     return [
         [sum(float(a[k][i]) * float(b[k][j]) for k in range(3)) for j in range(3)]
@@ -540,11 +545,13 @@ def write_pose_row(f: Any, seq: int, timestamp: float, frame: int, ego_tf: Any, 
     rel = relative_target_pose(ego_tf, target_tf)
     ego_qx, ego_qy, ego_qz, ego_qw = quaternion_from_matrix(rotation_matrix_carla_to_ros(ego_tf.rotation))
     target_qx, target_qy, target_qz, target_qw = quaternion_from_matrix(rotation_matrix_carla_to_ros(target_tf.rotation))
+    ego_x, ego_y, ego_z = location_carla_to_ros(ego_tf.location)
+    target_x, target_y, target_z = location_carla_to_ros(target_tf.location)
     f.write(
         f"{seq},{timestamp:.9f},{frame},"
-        f"{ego_tf.location.x:.9f},{ego_tf.location.y:.9f},{ego_tf.location.z:.9f},"
+        f"{ego_x:.9f},{ego_y:.9f},{ego_z:.9f},"
         f"{ego_qx:.9f},{ego_qy:.9f},{ego_qz:.9f},{ego_qw:.9f},"
-        f"{target_tf.location.x:.9f},{target_tf.location.y:.9f},{target_tf.location.z:.9f},"
+        f"{target_x:.9f},{target_y:.9f},{target_z:.9f},"
         f"{target_qx:.9f},{target_qy:.9f},{target_qz:.9f},{target_qw:.9f},"
         f"{rel['x']:.9f},{rel['y']:.9f},{rel['z']:.9f},"
         f"{rel['qx']:.9f},{rel['qy']:.9f},{rel['qz']:.9f},{rel['qw']:.9f}\n"
@@ -568,9 +575,11 @@ def save_scenario_paths(path: str, ego_nodes: Sequence[Any], target_nodes: Seque
 
 def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     def pose(tf: Any) -> str:
+        pose_ros = rec.transform_carla_to_ros_dict(tf)
         return (
-            f"{{x: {tf.location.x:.9f}, y: {tf.location.y:.9f}, z: {tf.location.z:.9f}, "
-            f"roll: {tf.rotation.roll:.9f}, pitch: {tf.rotation.pitch:.9f}, yaw: {tf.rotation.yaw:.9f}}}"
+            f"{{x: {pose_ros['x']:.9f}, y: {pose_ros['y']:.9f}, z: {pose_ros['z']:.9f}, "
+            f"qx: {pose_ros['qx']:.9f}, qy: {pose_ros['qy']:.9f}, "
+            f"qz: {pose_ros['qz']:.9f}, qw: {pose_ros['qw']:.9f}}}"
         )
 
     text = "\nscenario:\n"
@@ -578,7 +587,7 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
     text += f"  completed: {str(bool(summary['completed'])).lower()}\n"
     text += f"  ego_blueprint: {rec.yaml_quote(summary['ego_blueprint'])}\n"
     text += f"  target_blueprint: {rec.yaml_quote(summary['target_blueprint'])}\n"
-    text += f"  area_center_carla: {pose(summary['area_center_carla'])}\n"
+    text += f"  area_center_ros: {pose(summary['area_center_ros'])}\n"
     text += f"  area_length_m: {summary['area_length_m']:.9f}\n"
     text += f"  area_width_m: {summary['area_width_m']:.9f}\n"
     text += f"  min_separation_m: {summary['min_separation_m']:.9f}\n"
@@ -607,6 +616,155 @@ def append_scenario_summary(path: str, summary: Dict[str, Any]) -> None:
         f.write(text)
 
 
+def run_preview_only(args: argparse.Namespace, carla: Any, rng: random.Random, world_dt: float) -> None:
+    client = carla.Client(args.host, args.port)
+    client.set_timeout(args.timeout)
+
+    world = None
+    original_settings = None
+    actors: List[Any] = []
+
+    try:
+        world = rec.get_or_load_world(client, args)
+        original_settings = world.get_settings()
+        settings = world.get_settings()
+        settings.synchronous_mode = True
+        settings.fixed_delta_seconds = world_dt
+        world.apply_settings(settings)
+
+        bp_lib = world.get_blueprint_library()
+        ego_bp = orbit_rec.pick_exact_vehicle_blueprint(bp_lib, args.ego_blueprint, args.ego_filter, "ego", rng)
+        target_bp = orbit_rec.pick_exact_vehicle_blueprint(bp_lib, args.target_blueprint, args.target_filter, "target", rng)
+
+        area_tf = resolve_area_transform(carla, world, args)
+        ego_zone_tf, ego_path_args, target_zone_tf, target_path_args = zone_transforms_and_args(carla, area_tf, args)
+        ego_nodes = build_ego_path(carla, ego_zone_tf, ego_path_args)
+        target_nodes = build_target_path(carla, target_zone_tf, target_path_args)
+        ego_cumulative = cumulative_lengths(ego_nodes)
+        target_cumulative = cumulative_lengths(target_nodes)
+        if ego_cumulative[-1] <= 1e-6 or target_cumulative[-1] <= 1e-6:
+            raise RuntimeError("generated trajectory path is empty")
+
+        ego_start_tf = transform_closed_at_distance(carla, ego_nodes, ego_cumulative, 0.0, float(args.lookahead_m))
+        target_start_tf = transform_closed_at_distance(
+            carla, target_nodes, target_cumulative, float(args.target_phase_m), float(args.lookahead_m)
+        )
+
+        target = world.try_spawn_actor(target_bp, target_start_tf)
+        if target is None:
+            raise RuntimeError("failed to spawn target vehicle B at its trajectory start pose")
+        actors.append(target)
+
+        ego = world.try_spawn_actor(ego_bp, ego_start_tf)
+        if ego is None:
+            raise RuntimeError("failed to spawn ego vehicle A at its trajectory start pose")
+        actors.append(ego)
+
+        for actor in (ego, target):
+            try:
+                actor.set_simulate_physics(False)
+            except Exception:
+                pass
+
+        required_center_sep = max(
+            float(args.min_separation),
+            actor_planar_radius(ego) + actor_planar_radius(target) + float(args.collision_margin),
+        )
+        planned_min_sep = min_sampled_path_separation(
+            ego_nodes,
+            ego_cumulative,
+            target_nodes,
+            target_cumulative,
+            args.ego_speed_kmh,
+            args.target_speed_kmh,
+            args.target_phase_m,
+            args.duration,
+            args.separation_check_samples,
+        )
+        if planned_min_sep < required_center_sep:
+            raise RuntimeError(
+                f"planned A/B trajectories are too close: sampled_min={planned_min_sep:.2f}m "
+                f"required_center_separation={required_center_sep:.2f}m. "
+                "Increase --area-width/--zone-gap or lower path extents."
+            )
+
+        target_ticks = max(1, int(math.ceil(float(args.duration) / world_dt)))
+        stationary_ticks = min(target_ticks, int(math.ceil(float(args.stationary_start_duration) / world_dt)))
+        ego_state: Dict[str, Any] = {"distance_m": 0.0}
+        target_state: Dict[str, Any] = {"distance_m": float(args.target_phase_m)}
+        min_observed_sep = float("inf")
+        max_observed_sep = 0.0
+        tick_idx = 0
+        last_progress_t = time.time()
+        next_tick_t = time.time()
+
+        print("[PREVIEW] output disabled; no sensors or files will be created")
+        print(
+            f"[SCENARIO] ego={ego_bp.id} target={target_bp.id} "
+            f"ego_path={ego_cumulative[-1]:.1f}m target_path={target_cumulative[-1]:.1f}m "
+            f"duration={args.duration:.1f}s planned_min_sep={planned_min_sep:.2f}m"
+        )
+
+        while tick_idx < target_ticks:
+            if tick_idx < stationary_ticks:
+                ego_tf = ego_start_tf
+                target_tf = target_start_tf
+                hold_actor_kinematic_stopped(carla, ego, ego_tf)
+                hold_actor_kinematic_stopped(carla, target, target_tf)
+            else:
+                ego_tf = apply_kinematic_actor(
+                    carla, ego, ego_nodes, ego_cumulative, ego_state, args.ego_speed_kmh, args.lookahead_m, world_dt
+                )
+                target_tf = apply_kinematic_actor(
+                    carla,
+                    target,
+                    target_nodes,
+                    target_cumulative,
+                    target_state,
+                    args.target_speed_kmh,
+                    args.lookahead_m,
+                    world_dt,
+                )
+
+            world.tick()
+            tick_idx += 1
+
+            rel = relative_target_pose(ego_tf, target_tf)
+            sep = math.sqrt(float(rel["x"]) ** 2 + float(rel["y"]) ** 2 + float(rel["z"]) ** 2)
+            min_observed_sep = min(min_observed_sep, sep)
+            max_observed_sep = max(max_observed_sep, sep)
+
+            now = time.time()
+            if now - last_progress_t >= 2.0:
+                sim_done = tick_idx * world_dt
+                print(
+                    f"[PREVIEW] sim={sim_done:.2f}/{args.duration:.2f}s "
+                    f"sep={sep:.1f}m min_sep={min_observed_sep:.1f}m max_sep={max_observed_sep:.1f}m "
+                    f"phase={'stationary' if tick_idx <= stationary_ticks else 'moving'}"
+                )
+                last_progress_t = now
+
+            next_tick_t += world_dt
+            sleep_s = next_tick_t - time.time()
+            if sleep_s > 0.0:
+                time.sleep(sleep_s)
+
+    finally:
+        for actor in reversed(actors):
+            try:
+                actor.destroy()
+            except Exception:
+                pass
+
+        try:
+            if world is not None and original_settings is not None:
+                world.apply_settings(original_settings)
+        except Exception:
+            pass
+
+    print("[DONE] preview finalized")
+
+
 def main() -> None:
     args = parse_args_with_config()
     if args.duration <= 0.0:
@@ -620,6 +778,10 @@ def main() -> None:
     carla = rec.import_carla_or_exit(args.carla_root)
 
     world_dt = float(args.fixed_dt)
+    if args.preview_only:
+        run_preview_only(args, carla, rng, world_dt)
+        return
+
     camera_ticks = 0 if args.no_camera else rec.ensure_integer_period_ticks("camera", args.camera_hz, world_dt)
     lidar_sweep_ticks = rec.ensure_integer_period_ticks("lidar", args.lidar_hz, world_dt)
     imu_ticks = rec.ensure_integer_period_ticks("imu", args.imu_hz, world_dt)
@@ -1033,7 +1195,7 @@ def main() -> None:
                 "completed": completed,
                 "ego_blueprint": ego_bp.id,
                 "target_blueprint": target_bp.id,
-                "area_center_carla": area_tf,
+                "area_center_ros": area_tf,
                 "area_length_m": float(args.area_length),
                 "area_width_m": float(args.area_width),
                 "min_separation_m": float(args.min_separation),

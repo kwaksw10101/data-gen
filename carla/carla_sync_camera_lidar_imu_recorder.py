@@ -509,6 +509,68 @@ def ros_transform_from_carla_location(x: float, y: float, z: float) -> Dict[str,
     return {"x": float(x), "y": float(-y), "z": float(z), "roll": 0.0, "pitch": 0.0, "yaw": 0.0}
 
 
+def rotation_matrix_carla_to_ros(rotation: Any) -> List[List[float]]:
+    roll = math.radians(float(rotation.roll))
+    pitch = math.radians(float(rotation.pitch))
+    yaw = math.radians(float(rotation.yaw))
+    cr, sr = math.cos(roll), math.sin(roll)
+    cp, sp = math.cos(pitch), math.sin(pitch)
+    cy, sy = math.cos(yaw), math.sin(yaw)
+    carla_matrix = [
+        [cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr],
+        [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr],
+        [-sp, cp * sr, cp * cr],
+    ]
+    return [
+        [carla_matrix[0][0], -carla_matrix[0][1], carla_matrix[0][2]],
+        [-carla_matrix[1][0], carla_matrix[1][1], -carla_matrix[1][2]],
+        [carla_matrix[2][0], -carla_matrix[2][1], carla_matrix[2][2]],
+    ]
+
+
+def quaternion_from_matrix(m: Sequence[Sequence[float]]) -> Tuple[float, float, float, float]:
+    trace = float(m[0][0]) + float(m[1][1]) + float(m[2][2])
+    if trace > 0.0:
+        s = math.sqrt(trace + 1.0) * 2.0
+        qw = 0.25 * s
+        qx = (float(m[2][1]) - float(m[1][2])) / s
+        qy = (float(m[0][2]) - float(m[2][0])) / s
+        qz = (float(m[1][0]) - float(m[0][1])) / s
+    elif float(m[0][0]) > float(m[1][1]) and float(m[0][0]) > float(m[2][2]):
+        s = math.sqrt(1.0 + float(m[0][0]) - float(m[1][1]) - float(m[2][2])) * 2.0
+        qw = (float(m[2][1]) - float(m[1][2])) / s
+        qx = 0.25 * s
+        qy = (float(m[0][1]) + float(m[1][0])) / s
+        qz = (float(m[0][2]) + float(m[2][0])) / s
+    elif float(m[1][1]) > float(m[2][2]):
+        s = math.sqrt(1.0 + float(m[1][1]) - float(m[0][0]) - float(m[2][2])) * 2.0
+        qw = (float(m[0][2]) - float(m[2][0])) / s
+        qx = (float(m[0][1]) + float(m[1][0])) / s
+        qy = 0.25 * s
+        qz = (float(m[1][2]) + float(m[2][1])) / s
+    else:
+        s = math.sqrt(1.0 + float(m[2][2]) - float(m[0][0]) - float(m[1][1])) * 2.0
+        qw = (float(m[1][0]) - float(m[0][1])) / s
+        qx = (float(m[0][2]) + float(m[2][0])) / s
+        qy = (float(m[1][2]) + float(m[2][1])) / s
+        qz = 0.25 * s
+    norm = max(1e-12, math.sqrt(qx * qx + qy * qy + qz * qz + qw * qw))
+    return qx / norm, qy / norm, qz / norm, qw / norm
+
+
+def transform_carla_to_ros_dict(tf: Any) -> Dict[str, float]:
+    qx, qy, qz, qw = quaternion_from_matrix(rotation_matrix_carla_to_ros(tf.rotation))
+    return {
+        "x": float(tf.location.x),
+        "y": -float(tf.location.y),
+        "z": float(tf.location.z),
+        "qx": qx,
+        "qy": qy,
+        "qz": qz,
+        "qw": qw,
+    }
+
+
 def relative_ros_transform(parent_to_child: Dict[str, float], parent_to_other: Dict[str, float]) -> Dict[str, float]:
     return {
         "x": float(parent_to_other["x"] - parent_to_child["x"]),
@@ -547,7 +609,7 @@ def write_meta(
     fy = fx
     cx = args.camera_width * 0.5
     cy = args.camera_height * 0.5
-    spawn = transform_to_dict(spawn_tf)
+    spawn = transform_carla_to_ros_dict(spawn_tf)
     camera_tf_ros = ros_transform_from_carla_location(args.camera_x, args.camera_y, args.camera_z)
     lidar_tf_ros = ros_transform_from_carla_location(args.lidar_x, args.lidar_y, args.lidar_z)
     imu_tf_ros = ros_transform_from_carla_location(args.imu_x, args.imu_y, args.imu_z)
@@ -566,13 +628,14 @@ carla:
   server_version: {yaml_quote(server_version)}
   map: {yaml_quote(map_name)}
   vehicle_blueprint: {yaml_quote(vehicle_id)}
-  spawn_carla:
+  spawn_ros:
     x: {spawn["x"]:.9f}
     y: {spawn["y"]:.9f}
     z: {spawn["z"]:.9f}
-    roll: {spawn["roll"]:.9f}
-    pitch: {spawn["pitch"]:.9f}
-    yaw: {spawn["yaw"]:.9f}
+    qx: {spawn["qx"]:.9f}
+    qy: {spawn["qy"]:.9f}
+    qz: {spawn["qz"]:.9f}
+    qw: {spawn["qw"]:.9f}
 
 world:
   synchronous_mode: true
